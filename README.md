@@ -8,19 +8,16 @@ Made by **Rune**. Free and open source: use it, change it, share it. Please cred
 
 ## Download
 
-Get the latest zip from **[Releases](../../releases/latest)**. It contains:
+Get it from **[Releases](../../releases/latest)**:
 
-- `L4D2_Map_Editor.py`, the tool
-- `L4D2 Map Editor - Guide.pdf`, the full 15-page guide (FAQ and troubleshooting included)
+- **`L4D2.Map.Editor.exe`**: double-click and go, nothing to install (Windows only).
+- **`L4D2.Map.Editor.by.Rune.zip`**: the Python version and the full 15-page guide (FAQ and troubleshooting included).
 
-## Requirements
+Windows may say "Windows protected your PC" because the .exe isn't signed by a company: click **More info**, then **Run anyway**. If your antivirus complains, use the Python version: it's the same tool.
 
-- Windows
-- [Python 3.8 or newer](https://www.python.org/downloads/) (tick **Add Python to PATH** when installing). Nothing else to install.
+## Python version
 
-## Run it
-
-Open a command prompt in the folder with the script and run:
+`L4D2_Map_Editor.py` needs [Python 3.8 or newer](https://www.python.org/downloads/) (tick **Add Python to PATH** when installing), nothing else. Open a command prompt in its folder and run:
 
 ```
 python L4D2_Map_Editor.py

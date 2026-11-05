@@ -1389,6 +1389,12 @@ class App:
         self.root = tk.Tk()
         self.root.title("L4D2 Map Editor by Rune")
         self.root.minsize(1280, 640)
+        icon = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "icon.ico")
+        if os.path.exists(icon):                 # bundled in the .exe; optional next to the .py
+            try:
+                self.root.iconbitmap(icon)
+            except Exception:
+                pass
         self.m = None
         self.view, self.rot, self.mode = "iso", 0, "walls"
         self.S, self.T = None, (0.0, 0.0)     # projection -> canvas: p * S + T
@@ -1400,7 +1406,7 @@ class App:
         self._build()
         self.root.report_callback_exception = self._crash
         if path:
-            self.root.after(50, lambda: self.open(path, inner))
+            self.root.after(50, lambda: self.open_path(path, inner))
         else:
             self.root.after(50, self.welcome)
 
@@ -1699,10 +1705,12 @@ class App:
     def ask_open(self):
         path = self.fd.askopenfilename(title="Open a map (.bsp) or an addon / pak01_dir (.vpk)",
                                        filetypes=[("Maps and addons", "*.bsp *.vpk"), ("All files", "*.*")])
-        if not path:
-            return
-        inner = None
-        if path.lower().endswith(".vpk"):
+        if path:
+            self.open_path(path)
+
+    def open_path(self, path, inner=None):
+        """open a .bsp, or a .vpk (asking which map when it holds several)"""
+        if inner is None and path.lower().endswith(".vpk"):
             try:
                 names = maps_in_vpk(path)
             except (ValueError, OSError) as e:
@@ -2559,6 +2567,8 @@ def cli(args):
 
 
 if __name__ == "__main__":
+    if sys.stdout is None:          # the windowed .exe has no console: keep command-line mode from crashing
+        sys.stdout = sys.stderr = open(os.devnull, "w")
     if sys.argv[1:2] == ["check"]:
         print(report_text(check_setup(sys.argv[2] if len(sys.argv) > 2 else find_game())))
     elif len(sys.argv) > 2:
