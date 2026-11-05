@@ -1,7 +1,7 @@
 # L4D2_Map_Editor.py - L4D2 Map Editor: edit L4D2 maps through .lmp patches (invisible walls, entities)
 # Made by Rune. Open source: free to use, change and share. Please credit Rune if you share it.
 #
-#   python L4D2_Map_Editor.py                  opens the window (Walls and Entities modes)
+#   python L4D2_Map_Editor.py                  opens the window (Walls, Entities and Build modes)
 #   python L4D2_Map_Editor.py <map.bsp|addon.vpk>
 #   python L4D2_Map_Editor.py check [Left 4 Dead 2 folder]     finds problems with your patches and addons
 #
@@ -11,12 +11,14 @@
 #
 # A .lmp replaces one part ("lump") of a map when it loads. Walls mode writes the brushes lump (18) with
 # the player-clip flag turned off on the walls you pick. Entities mode writes the entity lump (0): delete,
-# move, copy, add and edit entities. Nothing is recompiled and the map itself is never shipped.
+# move, copy, add and edit entities. Build mode places the game's own props (prop_dynamic) and invisible
+# walls around them. Props are drawn with their real shapes, read from the game's model files (.mdl/.vvd/.vtx).
+# Nothing is recompiled and the map itself is never shipped.
 #
 # The tool reads the patches that already exist for the map (Valve's in update/maps, any inside the same
 # addon .vpk), builds on them so their fixes are kept, picks free file numbers, and also writes your change
 # into Valve's game-mode versions of the patch (_h_, _s_) when the map has them.
-import lzma, os, re, struct, sys
+import lzma, math, os, re, struct, sys, time
 
 PLAYERCLIP, SOLID = 0x10000, 0x1
 LUMP_ENTITIES, LUMP_BRUSHES = 0, 18
@@ -64,14 +66,17 @@ def vpk_tree(path):
     return out
 
 
-def vpk_read(path, entry):
+def vpk_read(path, entry, limit=None):
     arc, ofs, ln, pre, data_start = entry
+    if limit is not None and len(pre) >= limit:
+        return pre[:limit]
     if not ln:
         return pre
+    n = ln if limit is None else min(ln, limit - len(pre))
     part = path if arc == 0x7FFF else re.sub(r"_dir\.vpk$", "_%03d.vpk" % arc, path, flags=re.I)
     with open(part, "rb") as f:
         f.seek(data_start + ofs if arc == 0x7FFF else ofs)
-        return pre + f.read(ln)
+        return pre + f.read(n)
 
 
 def maps_in_vpk(path):
@@ -319,6 +324,49 @@ def clip_below(pts, cut):
     return out
 
 
+def split_polygon(pts, axis, value):
+    """the parts of a convex polygon below and above `value` along `axis` (a direction vector)"""
+    lo, hi = [], []
+    d = [p[0] * axis[0] + p[1] * axis[1] + p[2] * axis[2] - value for p in pts]
+    for j in range(len(pts)):
+        p, q, dp, dq = pts[j - 1], pts[j], d[j - 1], d[j]
+        if (dp < 0) != (dq < 0):
+            t = dp / (dp - dq)
+            x = (p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t, p[2] + (q[2] - p[2]) * t)
+            lo.append(x)
+            hi.append(x)
+        (lo if dq < 0 else hi).append(q)
+    return lo, hi
+
+
+def tile_faces(faces, step_h=128.0, step_v=96.0):
+    """[(points, normal, rgb, face index)] - big faces cut into pieces so they sort right against props"""
+    out = []
+    for fi, (pts, n, _dist, rgb) in enumerate(faces):
+        if abs(n[2]) > 0.7:                       # floors and roofs: a grid
+            axes = (((1.0, 0.0, 0.0), step_h), ((0.0, 1.0, 0.0), step_h))
+        else:                                     # walls: rows and columns
+            hl = (n[0] * n[0] + n[1] * n[1]) ** 0.5 or 1.0
+            axes = (((0.0, 0.0, 1.0), step_v), ((-n[1] / hl, n[0] / hl, 0.0), step_h))
+        pieces = [pts]
+        for axis, step in axes:
+            nxt = []
+            for poly in pieces:
+                vals = [p[0] * axis[0] + p[1] * axis[1] + p[2] * axis[2] for p in poly]
+                k = math.floor(min(vals) / step) + 1
+                rest = poly
+                while k * step < max(vals) - 0.5 and len(rest) >= 3:
+                    a, rest = split_polygon(rest, axis, k * step)
+                    if len(a) >= 3:
+                        nxt.append(a)
+                    k += 1
+                if len(rest) >= 3:
+                    nxt.append(rest)
+            pieces = nxt
+        out.extend((p, n, rgb, fi) for p in pieces)
+    return out
+
+
 def in_box(mn, mx, box):
     x0, x1 = sorted((box[0], box[2]))
     y0, y1 = sorted((box[1], box[3]))
@@ -518,9 +566,414 @@ TEMPLATES = {
 }
 
 
+# ---------------------------------------------------------------- props: game files, models, static props
+
+class GameFiles:
+    """read game files by path: the map's packed files first, then its addon .vpk, then the game's .vpk files"""
+
+    def __init__(self, game=None, d=None, vpk=None):
+        self.srcs = []                                      # (kind, handle, {path: entry})
+        if d is not None:
+            try:
+                import io, zipfile
+                z = zipfile.ZipFile(io.BytesIO(lump_bytes(d, 40)))
+                self.srcs.append(("zip", z, {n.lower().replace("\\", "/"): n for n in z.namelist()}))
+            except Exception:
+                pass
+        if vpk:
+            try:
+                self.srcs.append(("vpk", vpk, vpk_tree(vpk)))
+            except (OSError, ValueError, struct.error):
+                pass
+        if game:
+            for sub in OFFICIAL_DIRS:
+                p = os.path.join(game, sub, "pak01_dir.vpk")
+                try:
+                    self.srcs.append(("vpk", p, vpk_tree(p)))
+                except (OSError, ValueError, struct.error):
+                    pass
+
+    @staticmethod
+    def norm(path):
+        return path.lower().replace("\\", "/").lstrip("/")
+
+    def read(self, path, limit=None):
+        path = self.norm(path)
+        for kind, h, tree in self.srcs:
+            if path in tree:
+                try:
+                    if kind == "zip":
+                        b = h.read(tree[path])
+                        return b if limit is None else b[:limit]
+                    return vpk_read(h, tree[path], limit)
+                except Exception:
+                    return None
+        return None
+
+    def has(self, path):
+        path = self.norm(path)
+        return any(path in t for _k, _h, t in self.srcs)
+
+    def models(self):
+        out = set()
+        for _k, _h, t in self.srcs:
+            out.update(p for p in t if p.endswith(".mdl"))
+        return out
+
+
+NOT_PROPS = ("models/infected/", "models/survivors/", "models/v_models/", "models/w_models/", "models/weapons/",
+             "models/editor/", "models/player/", "models/props_skybox/", "models/skybox/", "models/characters/",
+             "models/extras/", "models/f18/", "models/missiles/")
+
+
+FOLIAGE = re.compile(r"foliage|(?<!s)tree|bush|shrub|hedge|palm|vine|grass|ivy|leaves|leaf")
+
+
+def linear_to_screen(rgb):
+    return tuple(min(1.0, max(0.06, c) ** (1 / 2.2) * 1.15) for c in rgb)
+
+
+def material_color(files, mat, cache):
+    """average color of a material (from its texture's stored reflectivity), or None"""
+    mat = GameFiles.norm(mat)
+    if mat in cache:
+        return cache[mat]
+    rgb = None
+    try:
+        vmt = files.read("materials/%s.vmt" % mat)
+        for _ in range(3):                                   # follow "patch" materials
+            if not vmt:
+                break
+            toks = [a or b for a, b in re.findall(r'"([^"]*)"|([^\s"{}]+)', vmt.decode("latin-1"))]
+            low = [t.lower() for t in toks]
+            if "$basetexture" in low and low.index("$basetexture") + 1 < len(toks):
+                tex = re.sub(r"\.vtf$", "", toks[low.index("$basetexture") + 1], flags=re.I)
+                vtf = files.read("materials/%s.vtf" % GameFiles.norm(tex), limit=48)
+                if vtf and vtf[:4] == b"VTF\0" and len(vtf) >= 44:
+                    rgb = linear_to_screen(struct.unpack_from("<3f", vtf, 32))
+                break
+            if "include" in low and low.index("include") + 1 < len(toks):
+                vmt = files.read(toks[low.index("include") + 1])
+                continue
+            break
+    except Exception:
+        rgb = None
+    cache[mat] = rgb
+    return rgb
+
+
+class Mesh:
+    """a model, simplified for drawing: verts, tris (i, j, k), one color per tri; bounds; collision"""
+    __slots__ = ("verts", "tris", "cols", "mins", "maxs", "solid", "full_tris", "light", "leafy")
+
+    def __init__(self, verts, tris, cols, mins, maxs, solid, full_tris):
+        self.verts, self.tris, self.cols = verts, tris, cols
+        self.mins, self.maxs, self.solid, self.full_tris = mins, maxs, solid, full_tris
+        self.light = simplify(verts, tris, cols, 28)        # lighter version for when it's small on screen
+        self.leafy = False
+
+
+def _mdl_triangles(mdl, vtx, sg_size):
+    """[(vvd vertex index, j, k, mesh material)] of LOD 0, first model of each body part"""
+    numbp, bpi = struct.unpack_from("<ii", mdl, 232)
+    vbpo = struct.unpack_from("<i", vtx, 32)[0]
+    out = []
+    for b in range(numbp):
+        mb = bpi + b * 16
+        nmodels, modelindex = struct.unpack_from("<i", mdl, mb + 4)[0], struct.unpack_from("<i", mdl, mb + 12)[0]
+        vb = vbpo + b * 8
+        _vnm, vmo = struct.unpack_from("<ii", vtx, vb)
+        if nmodels < 1:
+            continue
+        mm = mb + modelindex
+        nmesh, meshindex, _nv, vertexindex = struct.unpack_from("<iiii", mdl, mm + 72)
+        vm = vb + vmo
+        _nl, lodo = struct.unpack_from("<ii", vtx, vm)
+        vl = vm + lodo
+        vnmesh, meshoff = struct.unpack_from("<ii", vtx, vl)
+        for k in range(min(nmesh, vnmesh)):
+            ms = mm + meshindex + k * 116
+            mat, _mi, _nvm, voff = struct.unpack_from("<iiii", mdl, ms)
+            vme = vl + meshoff + k * 9
+            nsg, sgo = struct.unpack_from("<ii", vtx, vme)
+            base = vertexindex // 48 + voff
+            for g in range(nsg):
+                sg = vme + sgo + g * sg_size
+                nv, vo, ni, io_ = struct.unpack_from("<iiii", vtx, sg)
+                if nv < 0 or ni < 0 or ni % 3 or sg + io_ + ni * 2 > len(vtx) or sg + vo + nv * 9 > len(vtx):
+                    raise ValueError("bad strip group")
+                ids = [struct.unpack_from("<H", vtx, sg + vo + j * 9 + 4)[0] for j in range(nv)]
+                idx = struct.unpack_from("<%dH" % ni, vtx, sg + io_)
+                if ni and max(idx) >= nv:
+                    raise ValueError("bad index")
+                for t in range(0, ni, 3):
+                    out.append((base + ids[idx[t]], base + ids[idx[t + 1]], base + ids[idx[t + 2]], mat))
+    return out
+
+
+def _cross(a, b, c):
+    ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+    vx, vy, vz = c[0] - a[0], c[1] - a[1], c[2] - a[2]
+    return uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+
+
+def simplify(verts, tris, cols, limit):
+    """vertex clustering: merge vertices on a grid until there are at most `limit` triangles"""
+    if len(tris) <= limit:
+        return verts, tris, cols
+    xs, ys, zs = zip(*verts)
+    lo = (min(xs), min(ys), min(zs))
+    ext = (max(xs) - lo[0], max(ys) - lo[1], max(zs) - lo[2])
+    g, tried = 12.0, {}
+    for _ in range(6):
+        gi = max(2, int(g))
+        if gi in tried:
+            break
+        f = [gi / max(ext[a], 0.25 * gi) for a in range(3)]    # cells per unit; thin axes keep both sides
+        keys = zip([int((x - lo[0]) * f[0]) for x in xs], [int((y - lo[1]) * f[1]) for y in ys],
+                   [int((z - lo[2]) * f[2]) for z in zs])
+        cid = {}
+        remap = [cid.setdefault(k, len(cid)) for k in keys]
+        seen, nt, nc = set(), [], []
+        for (a, b, c), col in zip(tris, cols):
+            a, b, c = remap[a], remap[b], remap[c]
+            if a == b or b == c or a == c:
+                continue
+            k = (a, b, c) if a < b and a < c else ((b, c, a) if b < c else (c, a, b))
+            if k not in seen:
+                seen.add(k)
+                nt.append(k)
+                nc.append(col)
+        tried[gi] = (remap, len(cid), nt, nc)
+        if len(nt) <= limit:
+            break
+        g = gi * (limit / len(nt)) ** 0.5 * 0.9                 # triangles grow with the grid's area
+    ok = [k for k in tried if len(tried[k][2]) <= limit]
+    remap, n, nt, nc = tried[max(ok) if ok else min(tried)]
+    sx, sy, sz, cnt = [0.0] * n, [0.0] * n, [0.0] * n, [0] * n
+    for i, c in enumerate(remap):
+        x, y, z = verts[i]
+        sx[c] += x; sy[c] += y; sz[c] += z; cnt[c] += 1
+    used = sorted({i for t in nt for i in t})
+    pos = {o: k for k, o in enumerate(used)}
+    return ([(sx[i] / cnt[i], sy[i] / cnt[i], sz[i] / cnt[i]) for i in used],
+            [(pos[a], pos[b], pos[c]) for a, b, c in nt], nc)
+
+
+def load_mesh(files, name, mat_cache, limit=160):
+    """Mesh for a .mdl, or None when it can't be read"""
+    name = GameFiles.norm(name)
+    mdl = files.read(name)
+    if not mdl or len(mdl) < 408 or mdl[:4] != b"IDST":
+        return None
+    stem = name[:-4]
+    vvd = files.read(stem + ".vvd")
+    vtx = files.read(stem + ".dx90.vtx") or files.read(stem + ".vtx") or files.read(stem + ".dx80.vtx")
+    if not vvd or not vtx or vvd[:4] != b"IDSV":
+        return None
+    try:
+        tris = None
+        for sg_size in (25, 33):                             # older / newer strip group layout
+            try:
+                tris = _mdl_triangles(mdl, vtx, sg_size)
+                if tris:
+                    break
+            except (ValueError, struct.error, IndexError):
+                tris = None
+        if not tris:
+            return None
+        nverts0 = struct.unpack_from("<i", vvd, 16)[0]
+        nfix, fixstart, vstart = struct.unpack_from("<iii", vvd, 48)
+        order = None
+        if nfix:
+            order = []
+            for k in range(nfix):
+                lod, src, num = struct.unpack_from("<iii", vvd, fixstart + k * 12)
+                if lod >= 0:
+                    order.extend(range(src, src + num))
+        total = len(order) if order else nverts0
+        # materials: skin family 0 -> texture -> first cd folder that has it
+        numtex, texidx, numcd, cdidx = struct.unpack_from("<iiii", mdl, 204)
+        nskinref, _nfam, skinidx = struct.unpack_from("<iii", mdl, 220)
+        cds = [cstr(mdl, struct.unpack_from("<i", mdl, cdidx + 4 * i)[0]) for i in range(numcd)]
+        texcols = []
+        for t in range(numtex):
+            to = texidx + t * 64
+            tname = cstr(mdl, to + struct.unpack_from("<i", mdl, to)[0])
+            col = None
+            for cd in cds:
+                col = material_color(files, cd + tname, mat_cache)
+                if col:
+                    break
+            texcols.append(col)
+        grey = (0.62, 0.6, 0.57)
+        verts, vmap, vnorm, ts, cs = [], {}, [], [], []
+        for a, b, c, mat in tris:
+            if max(a, b, c) >= total:
+                return None
+            tri = []
+            for i in (a, b, c):
+                if i not in vmap:
+                    src = order[i] if order else i
+                    vmap[i] = len(verts)
+                    verts.append(struct.unpack_from("<3f", vvd, vstart + src * 48 + 16))
+                    vnorm.append(struct.unpack_from("<3f", vvd, vstart + src * 48 + 28))
+                tri.append(vmap[i])
+            ts.append(tuple(tri))
+            ref = struct.unpack_from("<h", mdl, skinidx + 2 * mat)[0] if 0 <= mat < nskinref else mat
+            cs.append((texcols[ref] if 0 <= ref < len(texcols) else None) or grey)
+        # which winding faces outward: compare with the stored vertex normals
+        score = 0.0
+        for a, b, c in ts:
+            n = _cross(verts[a], verts[b], verts[c])
+            m = [vnorm[a][k] + vnorm[b][k] + vnorm[c][k] for k in range(3)]
+            score += n[0] * m[0] + n[1] * m[1] + n[2] * m[2]
+        if score < 0:
+            ts = [(a, c, b) for a, b, c in ts]
+        leafy = bool(FOLIAGE.search(name.rsplit("/", 2)[-2] + "/" + name.rsplit("/", 1)[-1]))
+        if leafy:
+            # leaf textures are mostly see-through, so their stored color is near black: use a leafy green
+            cs = [(0.36, 0.46, 0.25) if max(c) - min(c) < 0.06 else c for c in cs]
+        full = len(ts)
+        mins = tuple(min(v[k] for v in verts) for k in range(3))      # exact size, before simplifying
+        maxs = tuple(max(v[k] for v in verts) for k in range(3))
+        verts, ts, cs = simplify(verts, ts, cs, min(limit, 64) if leafy else limit)   # leaves need little detail
+        mesh = Mesh(verts, ts, cs, mins, maxs, files.has(stem + ".phy"), full)
+        mesh.leafy = leafy
+        return mesh
+    except (struct.error, IndexError, ValueError):
+        return None
+
+
+def cstr(b, o):
+    e = b.find(b"\0", o)
+    return b[o:e if e >= 0 else len(b)].decode("latin-1")
+
+
+def angle_matrix(pitch, yaw, roll):
+    """Source angles (degrees) -> the model's forward, left and up axes in the world"""
+    p, y, r = math.radians(pitch), math.radians(yaw), math.radians(roll)
+    sp, cp, sy, cy, sr, cr = math.sin(p), math.cos(p), math.sin(y), math.cos(y), math.sin(r), math.cos(r)
+    return ((cp * cy, cp * sy, -sp),
+            (sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, sr * cp),
+            (cr * sp * cy + sr * sy, cr * sp * sy - sr * cy, cr * cp))
+
+
+def parse_vec(s, default=(0.0, 0.0, 0.0)):
+    try:
+        v = tuple(float(x) for x in s.split()[:3])
+        return v if len(v) == 3 else default
+    except ValueError:
+        return default
+
+
+class Placed:
+    """a model placed in the world: world-space vertices, triangle normals and bounds"""
+    __slots__ = ("mesh", "full", "lite", "mins", "maxs", "box", "boxn", "boxc", "corners")
+
+    def __init__(self, mesh, origin, angles, scale=1.0):
+        f, l, u = angle_matrix(*angles)
+        ox, oy, oz = origin
+        self.mesh = mesh
+
+        def world(verts, tris, cols):
+            wv = [(ox + scale * (x * f[0] + y * l[0] + z * u[0]),
+                   oy + scale * (x * f[1] + y * l[1] + z * u[1]),
+                   oz + scale * (x * f[2] + y * l[2] + z * u[2])) for x, y, z in verts]
+            out = []
+            for (a, b, c), col in zip(tris, cols):
+                n = _cross(wv[a], wv[b], wv[c])
+                ln = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) ** 0.5 or 1.0
+                out.append(((wv[a], wv[b], wv[c]), (n[0] / ln, n[1] / ln, n[2] / ln), col))
+            return out, wv
+        self.full, _wv = world(mesh.verts, mesh.tris, mesh.cols)
+        self.lite = world(*mesh.light)[0] if len(mesh.light[1]) < len(mesh.tris) else self.full
+        # a plain box in the model's average color, for when it's small on screen
+        cols = mesh.cols or [(0.6, 0.6, 0.6)]
+        self.boxc = tuple(sum(c[k] for c in cols) / len(cols) for k in range(3))
+        lo, hi = mesh.mins, mesh.maxs
+        corner = lambda i, j, k: (ox + scale * ((lo, hi)[i][0] * f[0] + (lo, hi)[j][1] * l[0] + (lo, hi)[k][2] * u[0]),
+                                  oy + scale * ((lo, hi)[i][0] * f[1] + (lo, hi)[j][1] * l[1] + (lo, hi)[k][2] * u[1]),
+                                  oz + scale * ((lo, hi)[i][0] * f[2] + (lo, hi)[j][1] * l[2] + (lo, hi)[k][2] * u[2]))
+        quads = [((0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)), ((0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0)),
+                 ((1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)), ((0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)),
+                 ((0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)), ((0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1))]
+        self.box = [[corner(*c) for c in q] for q in quads]
+        bn = []
+        for q in self.box:
+            n = _cross(q[0], q[1], q[2])
+            ln = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) ** 0.5 or 1.0
+            bn.append((n[0] / ln, n[1] / ln, n[2] / ln))
+        self.boxn = bn
+        self.box = [(q, n, self.boxc) for q, n in zip(self.box, bn)]
+        self.corners = [corner(i, j, k) for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+        self.mins = tuple(min(v[k] for v in self.corners) for k in range(3))
+        self.maxs = tuple(max(v[k] for v in self.corners) for k in range(3))
+
+
+def convex_hull(pts):
+    """outline around 2D points (monotone chain)"""
+    pts = sorted(set(pts))
+    if len(pts) < 3:
+        return pts
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2 and ((out[-1][0] - out[-2][0]) * (p[1] - out[-2][1]) -
+                                     (out[-1][1] - out[-2][1]) * (p[0] - out[-2][0])) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+    lo, hi = half(pts), half(reversed(pts))
+    return lo[:-1] + hi[:-1]
+
+
+def static_props(d):
+    """[(model, origin, angles, solid)] for the props compiled into the map (prop_static)"""
+    try:
+        gl = lump_bytes(d, 35)
+        n, = struct.unpack_from("<i", gl, 0)
+        for k in range(n):
+            gid, fl, _ver, ofs, ln = struct.unpack_from("<iHHii", gl, 4 + k * 16)
+            if gid != 0x73707270:                            # 'sprp'
+                continue
+            raw = d[ofs:ofs + ln]
+            if raw[:4] == b"LZMA":
+                size, _packed = struct.unpack_from("<II", raw, 4)
+                props = raw[12:17]
+                lc, rest = props[0] % 9, props[0] // 9
+                filt = {"id": lzma.FILTER_LZMA1, "dict_size": struct.unpack_from("<I", props, 1)[0],
+                        "lc": lc, "lp": rest % 5, "pb": rest // 5}
+                raw = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[filt]).decompress(raw[17:], size)[:size]
+            p = 0
+            nd, = struct.unpack_from("<i", raw, p)
+            p += 4
+            names = [cstr(raw[p + i * 128:p + i * 128 + 128] + b"\0", 0) for i in range(nd)]
+            p += nd * 128
+            nl, = struct.unpack_from("<i", raw, p)
+            p += 4 + nl * 2
+            npr, = struct.unpack_from("<i", raw, p)
+            p += 4
+            if npr <= 0:
+                return []
+            size = (len(raw) - p) // npr
+            out = []
+            for i in range(npr):
+                o = p + i * size
+                ox, oy, oz, ax, ay, az, pt = struct.unpack_from("<6fH", raw, o)
+                solid = raw[o + 30]
+                if pt < nd:
+                    out.append((names[pt], (ox, oy, oz), (ax, ay, az), solid))
+            return out
+    except (struct.error, IndexError, lzma.LZMAError, ValueError):
+        pass
+    return []
+
+
 # ---------------------------------------------------------------- problem check and fixes
 
-OFFICIAL_DIRS = ["update", "left4dead2_dlc3", "left4dead2_dlc2", "left4dead2_dlc1", "left4dead2"]
+OFFICIAL_DIRS =["update", "left4dead2_dlc3", "left4dead2_dlc2", "left4dead2_dlc1", "left4dead2"]
 LMP_NAME = re.compile(r"^(.+)_([a-z])_(\d+)\.lmp$", re.I)
 
 
@@ -1342,6 +1795,20 @@ def report_text(results):
 
 RED, RED_SIDE, GREEN, GREEN_SIDE, HOVER = "#ff453a", "#a8281f", "#30d158", "#1f8a3a", "#ffd60a"
 SELECT = "#ffd60a"
+ENT_MODES = ("ents", "build")
+BUILD_CATS = ("Props", "Blockers & clips")
+LIB_CATS = [
+    ("All props", ()),
+    ("Fences & railings", ("fence", "rail", "gate", "chainlink", "guardrail")),
+    ("Walls & barricades", ("wall", "barricade", "barrier", "fortification", "plywood", "board", "sandbag",
+                            "concrete", "panel", "sheetrock")),
+    ("Containers & crates", ("crate", "container", "pallet", "box", "barrel", "dumpster", "cargo", "tank")),
+    ("Vehicles", ("vehicle", "car", "truck", "bus", "van", "boat", "trailer", "forklift", "humvee", "train")),
+    ("Furniture", ("furniture", "chair", "table", "couch", "sofa", "desk", "shelf", "bed", "cabinet", "bench",
+                   "counter", "interiors")),
+    ("Debris & junk", ("debris", "rubble", "junk", "trash", "garbage", "rock", "pile", "wreck")),
+    ("Stairs & platforms", ("stair", "step", "ramp", "platform", "scaffold", "ladder", "catwalk", "dock")),
+]
 
 HELP = """HOW TO USE  -  L4D2 Map Editor by Rune
 
@@ -1351,11 +1818,19 @@ Official maps are in Left 4 Dead 2/left4dead2/maps, left4dead2_dlc1-3/maps and u
 VIEW
    "2D" is a flat map from above, "Isometric" is 3D. Rotate turns the map, Fit shows all of it.
    Drag "Max height" down to cut away roofs and see the street level.
-   Mouse wheel = zoom, right-drag = move the view.
+   Mouse wheel = zoom, right-drag = move the view. Props (cars, fences, trees...) are drawn with
+   their real shapes; untick "Props" to hide them.
 
 WALLS MODE  (remove invisible walls)
    Red boxes are the invisible walls. Click one to remove it (green), click again to keep it.
-   Shift+drag picks every wall inside a box. "Pick all" / "Pick none".
+   Shift+drag picks every wall inside a box. "Pick all" / "Pick none" are at the bottom right.
+
+BUILD MODE  (add props: fences, walls, crates, cars...)
+   Find a prop in the list (search or pick a category), check it in the preview, then double-click
+   it and click on the map to place it. Select a placed prop to turn it (R key, Shift+R back),
+   move it (arrows, PageUp/PageDown), "Drop to floor", or add the next one in line to build a fence.
+   "Invisible wall around it" adds a blocker the size of the prop, so nobody squeezes through.
+   New props can't be new map shapes: they're the game's own models, like Valve's later map fixes.
 
 ENTITIES MODE  (doors, ladders, blockers, props, triggers...)
    Click an entity on the map or in the list to select it. Ctrl+click adds to the selection,
@@ -1403,6 +1878,11 @@ class App:
         self.sel = set()
         self.placing = None
         self.hover = None
+        self.files, self.meshes, self.mat_cache, self.placed_cache = None, {}, {}, {}
+        self.statics, self.static_placed = [], []
+        self.load_gen, self.load_msg = 0, ""
+        self.build_yaw = 0
+        self.library = []
         self._build()
         self.root.report_callback_exception = self._crash
         if path:
@@ -1421,38 +1901,42 @@ class App:
             pass
         bar = tk.Frame(self.root)
         bar.pack(fill="x")
-        tk.Button(bar, text="Open map...", command=self.ask_open).pack(side="left", padx=4, pady=3)
+        tk.Button(bar, text="Open map...", command=self.ask_open).pack(side="left", padx=(4, 2), pady=3)
 
         modes = tk.Frame(bar)
-        modes.pack(side="left", padx=(10, 4))
+        modes.pack(side="left", padx=(6, 2))
         self.mode_var = tk.StringVar(value=self.mode)
-        for label, value in (("Walls", "walls"), ("Entities", "ents")):
-            tk.Radiobutton(modes, text=label, value=value, variable=self.mode_var, indicatoron=0, width=8,
+        for label, value in (("Walls", "walls"), ("Entities", "ents"), ("Build", "build")):
+            tk.Radiobutton(modes, text=label, value=value, variable=self.mode_var, indicatoron=0, padx=8,
                            selectcolor="#ffe1a8", command=self.set_mode).pack(side="left")
 
         views = tk.Frame(bar)
-        views.pack(side="left", padx=(10, 4))
+        views.pack(side="left", padx=(6, 2))
         self.view_var = tk.StringVar(value=self.view)
         for label, value in (("2D", "top"), ("Isometric", "iso")):
-            tk.Radiobutton(views, text=label, value=value, variable=self.view_var, indicatoron=0, width=9,
+            tk.Radiobutton(views, text=label, value=value, variable=self.view_var, indicatoron=0, padx=8,
                            selectcolor="#cfe3ff", command=self.set_view).pack(side="left")
-        tk.Button(bar, text="Rotate", command=self.rotate).pack(side="left", padx=4)
-        tk.Button(bar, text="Fit", command=self.refit).pack(side="left", padx=4)
-        tk.Label(bar, text="Max height").pack(side="left", padx=(10, 2))
-        self.cut = tk.Scale(bar, orient="horizontal", length=120, showvalue=True, command=self._cut_moved)
+        tk.Button(bar, text="Rotate", command=self.rotate).pack(side="left", padx=2)
+        tk.Button(bar, text="Fit", command=self.refit).pack(side="left", padx=2)
+        tk.Label(bar, text="Max height").pack(side="left", padx=(6, 0))
+        self.cut = tk.Scale(bar, orient="horizontal", length=95, showvalue=True, command=self._cut_moved)
         self.cut.pack(side="left")
+        self.props_on = tk.BooleanVar(value=True)
+        tk.Checkbutton(bar, text="Props", variable=self.props_on,
+                       command=lambda: self.m and self.redraw()).pack(side="left", padx=(2, 0))
 
-        tk.Button(bar, text="Help", command=self.show_help).pack(side="right", padx=4)
-        tk.Button(bar, text="Check problems", command=self.check_problems).pack(side="right", padx=4)
-        tk.Button(bar, text="Save .lmp", command=self.save).pack(side="right", padx=4)
-        tk.Button(bar, text="Load .lmp", command=self.load_lmp).pack(side="right", padx=4)
-        self.walls_bar = tk.Frame(bar)
+        tk.Button(bar, text="Help", command=self.show_help).pack(side="right", padx=2)
+        tk.Button(bar, text="Check problems", command=self.check_problems).pack(side="right", padx=2)
+        tk.Button(bar, text="Save .lmp", command=self.save).pack(side="right", padx=2)
+        tk.Button(bar, text="Load .lmp", command=self.load_lmp).pack(side="right", padx=2)
+        bottom = tk.Frame(self.root)
+        bottom.pack(fill="x", side="bottom")
+        self.status = tk.Label(bottom, anchor="w")
+        self.status.pack(side="left", fill="x", expand=True)
+        self.walls_bar = tk.Frame(bottom)
         self.walls_bar.pack(side="right")
         tk.Button(self.walls_bar, text="Pick none", command=lambda: self.set_all(False)).pack(side="right", padx=4)
         tk.Button(self.walls_bar, text="Pick all", command=lambda: self.set_all(True)).pack(side="right", padx=4)
-
-        self.status = tk.Label(self.root, anchor="w")
-        self.status.pack(fill="x", side="bottom")
         self.note = tk.Label(self.root, anchor="w", fg="#666")
         self.note.pack(fill="x", side="bottom")
 
@@ -1519,6 +2003,67 @@ class App:
         self.changes = tk.Label(side, anchor="w", fg="#444")
         self.changes.pack(fill="x", padx=6, pady=(0, 6))
 
+        # build side panel: props library, preview, and tools for the selected props
+        bs = self.build_side = tk.Frame(body, width=400)
+        top = tk.Frame(bs)
+        top.pack(fill="x", padx=6, pady=(6, 2))
+        tk.Label(top, text="Find a prop").pack(side="left")
+        self.lib_search = tk.StringVar()
+        self.lib_search.trace_add("write", lambda *_: self._lib_changed())
+        tk.Entry(top, textvariable=self.lib_search, width=14).pack(side="left", fill="x", expand=True, padx=4)
+        self.lib_cat = tk.StringVar(value=LIB_CATS[0][0])
+        ttk.Combobox(top, textvariable=self.lib_cat, values=[c[0] for c in LIB_CATS], state="readonly",
+                     width=17).pack(side="left")
+        self.lib_cat.trace_add("write", lambda *_: self._lib_changed())
+        # bottom part first, so the list (which stretches) gets what's left on small screens
+        self.build_info = tk.Label(bs, anchor="w", justify="left", fg="#444", wraplength=385)
+        self.build_info.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+        row = tk.Frame(bs)
+        row.pack(side="bottom", fill="x", padx=6, pady=2)
+        tk.Button(row, text="Delete", command=self.delete_sel).pack(side="left")
+        tk.Button(row, text="Copy", command=self.duplicate_sel).pack(side="left", padx=4)
+        tk.Button(row, text="Drop to floor", command=self.drop_sel).pack(side="left")
+        tk.Button(row, text="Redo", command=self.redo).pack(side="right")
+        tk.Button(row, text="Undo", command=self.undo).pack(side="right", padx=4)
+        row = tk.Frame(bs)
+        row.pack(side="bottom", fill="x", padx=6, pady=2)
+        tk.Label(row, text="Next in line").pack(side="left")
+        tk.Button(row, text="<", width=3, command=lambda: self.line_sel(-1)).pack(side="left", padx=(4, 1))
+        tk.Button(row, text=">", width=3, command=lambda: self.line_sel(1)).pack(side="left")
+        wall = tk.Menubutton(row, text="Invisible wall around it", relief="raised")
+        wm = tk.Menu(wall, tearoff=0)
+        wm.add_command(label="Same size as the prop", command=lambda: self.block_sel(0))
+        wm.add_command(label="Taller, so nobody can jump over it", command=lambda: self.block_sel(128))
+        wall["menu"] = wm
+        wall.pack(side="right")
+        row = tk.Frame(bs)
+        row.pack(side="bottom", fill="x", padx=6, pady=(6, 2))
+        tk.Label(row, text="Selected:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Label(row, text=" turn").pack(side="left")
+        for txt, deg in (("-90", -90), ("-15", -15), ("+15", 15), ("+90", 90)):
+            tk.Button(row, text=txt, width=4, command=lambda d=deg: self.rotate_sel(d)).pack(side="left", padx=1)
+        tk.Button(bs, text="Place it on the map  (or double-click the prop)",
+                  command=self.place_from_library).pack(side="bottom", fill="x", padx=6, pady=(2, 0))
+        self.preview_info = tk.Label(bs, anchor="w", justify="left", fg="#333", wraplength=385)
+        self.preview_info.pack(side="bottom", fill="x", padx=6)
+        self.preview = tk.Canvas(bs, height=100, bg="#26292e", highlightthickness=0)
+        bs.bind("<Configure>", lambda e: self.preview.config(height=100 if e.height > 640 else 64))
+        self.preview.pack(side="bottom", fill="x", padx=6, pady=(2, 0))
+        lf = tk.Frame(bs)
+        lf.pack(fill="both", expand=True, padx=6, pady=4)
+        self.lib = ttk.Treeview(lf, columns=("name", "folder"), show="headings", height=3, selectmode="browse")
+        self.lib.heading("name", text="Prop")
+        self.lib.heading("folder", text="Folder")
+        self.lib.column("name", width=210)
+        self.lib.column("folder", width=150)
+        sb = tk.Scrollbar(lf, command=self.lib.yview)
+        self.lib.config(yscrollcommand=sb.set)
+        self.lib.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.lib.bind("<<TreeviewSelect>>", lambda e: self.show_preview())
+        self.lib.bind("<Double-Button-1>", lambda e: self.place_from_library())
+        self.lib.bind("<Return>", lambda e: self.place_from_library())
+
         cv = self.cv
         cv.bind("<Motion>", self.on_move)
         cv.bind("<Button-1>", self.on_click)
@@ -1543,12 +2088,14 @@ class App:
                        ("Prior", (0, 0, 1)), ("Next", (0, 0, -1))):
             r.bind("<%s>" % key, lambda e, d=d: self._key(lambda: self.nudge(d, 8)))
             r.bind("<Shift-%s>" % key, lambda e, d=d: self._key(lambda: self.nudge(d, 64)))
+        for key, deg in (("r", 15), ("R", -15), ("bracketleft", -15), ("bracketright", 15)):
+            r.bind("<%s>" % key, lambda e, d=deg: self._key(lambda: self.rotate_sel(d)))
         self.box = {}
         self.dragging = None
 
     def _key(self, fn):
         w = self.root.focus_get()
-        if self.mode == "ents" and self.m and not (w is not None and w.winfo_class() in ("Entry", "TEntry")):
+        if self.mode in ENT_MODES and self.m and not (w is not None and w.winfo_class() in ("Entry", "TEntry")):
             fn()
         return "break"
 
@@ -1765,6 +2312,7 @@ class App:
             return
         self.root.config(cursor="")
         self.m, self.faces, self.models = m, faces, models
+        self.tiles = {}
         self.clips = {i: (mn, mx) for i, mn, mx in clips}
         self.picked = set()
         self.ent_prefix, self.ent_nl, self.ent_from = prefix, nl, ent_from
@@ -1774,6 +2322,7 @@ class App:
         self.undo_stack, self.redo_stack = [], []
         self.placing = None
         self.root.title("L4D2 Map Editor by Rune - " + m.name)
+        self.start_props(path)
         fz = sorted(p[2] for f in faces for p in f[0]) or [0, 1]
         self.zlo, self.zhi = fz[len(fz) // 100], fz[-1 - len(fz) // 100]
         lo = min([self.zlo] + [mn[2] for mn, mx in self.clips.values()])
@@ -1785,16 +2334,93 @@ class App:
         self.fill_list()
         self.refit()
 
+    # ---- props: loaded a few at a time after the map opens, so the map shows right away
+    def start_props(self, path):
+        self.load_gen += 1
+        game = game_root(path) or find_game()
+        if self.files is None or self.files_key != (game, path) or self.m.d is not getattr(self, "_files_d", None):
+            self.files = GameFiles(game, self.m.d, path if path.lower().endswith(".vpk") else None)
+            self.files_key, self._files_d = (game, path), self.m.d
+            self.meshes, self.mat_cache, self.placed_cache = {}, {}, {}
+        self.statics = static_props(self.m.d)
+        self.static_placed = []
+        self.floor_faces = None
+        names = {s[0].lower() for s in self.statics}
+        names |= {e.get("model").lower() for e in self.ents if e.get("model").lower().endswith(".mdl")}
+        self._queue = sorted(n for n in names if n not in self.meshes)
+        self._queue_total = len(self._queue)
+        self.library = sorted(p for p in self.files.models() if not p.startswith(NOT_PROPS))
+        self._lib_changed()
+        self.load_msg = "loading props..." if self._queue else ""
+        self.root.after(30, lambda g=self.load_gen: self._load_some(g))
+
+    def _load_some(self, gen):
+        import time
+        if gen != self.load_gen or not self.m:
+            return
+        end = time.perf_counter() + 0.06
+        while self._queue and time.perf_counter() < end:
+            n = self._queue.pop()
+            self.meshes[n] = load_mesh(self.files, n, self.mat_cache)
+        if self._queue:
+            done = self._queue_total - len(self._queue)
+            self.load_msg = "loading props %d%%" % (100 * done // max(self._queue_total, 1))
+            self._update_note()
+            self.root.after(1, lambda: self._load_some(gen))
+            return
+        self.static_placed = []
+        for name, o, a, _solid in self.statics:
+            mesh = self.meshes.get(name.lower())
+            if mesh:
+                self.static_placed.append(Placed(mesh, o, a))
+        missing = sum(1 for s in self.statics if not self.meshes.get(s[0].lower()))
+        self.load_msg = ("%d props" % len(self.static_placed)) + (
+            ("  (%d couldn't be read)" % missing) if missing else "")
+        self._update_note()
+        self.redraw()
+
+    def mesh(self, name):
+        """the drawable model, loading it now if needed (None if the game doesn't have it)"""
+        key = GameFiles.norm(name)
+        if key not in self.meshes and self.files:
+            self.meshes[key] = load_mesh(self.files, key, self.mat_cache)
+        return self.meshes.get(key)
+
+    def placed_for(self, e):
+        """Placed model for an entity with a .mdl model, or None"""
+        model = e.get("model")
+        if not model.lower().endswith(".mdl"):
+            return None
+        key = (model.lower(), e.get("origin"), e.get("angles"), e.get("modelscale"))
+        if key in self.placed_cache:
+            return self.placed_cache[key]
+        if GameFiles.norm(model) not in self.meshes and getattr(self, "_queue", None):
+            return None                                      # still loading: drawn once it's ready
+        mesh = self.mesh(model)
+        p = None
+        if mesh:
+            try:
+                scale = float(e.get("modelscale") or 1) or 1.0
+            except ValueError:
+                scale = 1.0
+            p = Placed(mesh, e.origin(), parse_vec(e.get("angles")), scale)
+        if len(self.placed_cache) > 20000:
+            self.placed_cache.clear()
+        self.placed_cache[key] = p
+        return p
+
     def _update_note(self):
         m = self.m
         if self.mode == "walls":
-            self.note.config(text="  " + m.notes())
+            s = "  " + m.notes()
         else:
             s = "  Entities from %s" % (self.ent_from or "the map itself")
             extra = [p for p in m.prefixes() if p != "l"]
             if extra:
                 s += "  -  saving also updates Valve's _%s_ game-mode versions" % "_, _".join(extra)
-            self.note.config(text=s)
+        if self.load_msg:
+            s += "   |   " + self.load_msg
+        self.note.config(text=s)
 
     def dirty(self):
         return bool(self.picked) or self.ents != self.base_ents
@@ -1802,15 +2428,21 @@ class App:
     # ---- modes and views
     def set_mode(self):
         self.mode = self.mode_var.get()
-        if self.mode == "ents":
+        self.side.pack_forget()
+        self.build_side.pack_forget()
+        if self.mode in ENT_MODES:
             self.walls_bar.pack_forget()
-            self.side.pack(side="right", fill="y")
-            self.side.pack_propagate(False)
+            panel = self.side if self.mode == "ents" else self.build_side
+            panel.pack(side="right", fill="y")
+            panel.pack_propagate(False)
         else:
-            self.side.pack_forget()
             self.walls_bar.pack(side="right")
         self.cancel_place()
         if self.m:
+            if self.mode == "build":
+                self.sel = {i for i in self.sel if category(self.ents[i].get("classname"))[0] in BUILD_CATS}
+            self.fill_list()
+            self.show_props()
             self._update_note()
             self.redraw()
 
@@ -1863,17 +2495,25 @@ class App:
         self.T = (self.T[0] + dx, self.T[1] + dy)
 
     def zoom(self, e, f):
+        """scale what's drawn at once, then redraw properly when the wheel stops (keeps zooming smooth)"""
         if not self.m:
             return
         cx, cy = self.cv.canvasx(e.x), self.cv.canvasy(e.y)
         self.S *= f
         self.T = (cx + (self.T[0] - cx) * f, cy + (self.T[1] - cy) * f)
-        self.redraw()
+        self.cv.scale("all", cx, cy, f, f)
+        if getattr(self, "_zoom_after", None):
+            self.root.after_cancel(self._zoom_after)
+        self._zoom_after = self.root.after(220, self.redraw)
 
     # ---- drawing
     def redraw(self):
         if not self.m:
             return
+        if getattr(self, "_zoom_after", None):
+            self.root.after_cancel(self._zoom_after)
+            self._zoom_after = None
+        t_start = time.perf_counter()
         cv, cut = self.cv, float(self.cut.get())
         cv.delete("all")
         self.item_brush, self.brush_items, self.area = {}, {}, {}
@@ -1881,10 +2521,31 @@ class App:
         iso = self.view == "iso"
         L = (-0.42, -0.58, 0.70)
         zspan = max(self.zhi - self.zlo, 1)
+        rot, proj = self.rot_xy, self.proj
+
+        if self.S is None:        # fit, ignoring far-off bits like the 3D skybox
+            pp = [proj(*p) for f in self.faces for p in f[0]]
+            xs, ys = sorted(p[0] for p in pp) or [0, 1], sorted(p[1] for p in pp) or [0, 1]
+            q = lambda v, f: v[min(len(v) - 1, int(len(v) * f))]
+            x0, x1, y0, y1 = q(xs, 0.01), q(xs, 0.99), q(ys, 0.01), q(ys, 0.99)
+            w = max(cv.winfo_width(), 400) - 60
+            h = max(cv.winfo_height(), 300) - 60
+            self.S = min(w / max(x1 - x0, 1), h / max(y1 - y0, 1))
+            self.T = (30 + (w - (x1 - x0) * self.S) / 2 - x0 * self.S,
+                      30 + (h - (y1 - y0) * self.S) / 2 - y0 * self.S)
+        s, (tx, ty) = self.S, self.T
+        cw, ch = max(cv.winfo_width(), 400), max(cv.winfo_height(), 300)
+        # walls are cut in pieces (so props sort right against them); smaller pieces when zoomed in
+        step = 128
+        while step < 2048 and step * s < 70:
+            step *= 2
+        if step not in self.tiles:
+            self.tiles[step] = tile_faces(self.faces, step, step * 0.75)
+        x_lo, x_hi, y_lo, y_hi = -tx / s, (cw - tx) / s, -ty / s, (ch - ty) / s    # visible area, projected units
 
         polys = []   # (sort key, points, fill, kind, ref)
-        for fi, (pts, n, _d, rgb) in enumerate(self.faces):
-            nx, ny = self.rot_xy(n[0], n[1])
+        for pts, n, rgb, fi in self.tiles[step]:
+            nx, ny = rot(n[0], n[1])
             if iso:
                 if -nx - ny + n[2] <= 0.02:
                     continue
@@ -1894,15 +2555,22 @@ class App:
                 pts = clip_below(pts, cut)
                 if len(pts) < 3:
                     continue
+            pp = [proj(*p) for p in pts]
+            px, py = [a for a, _b in pp], [b for _a, b in pp]
+            if max(px) < x_lo or min(px) > x_hi or max(py) < y_lo or min(py) > y_hi:
+                continue
             zavg = sum(p[2] for p in pts) / len(pts)
             light = 0.42 + 0.58 * max(0.0, nx * L[0] + ny * L[1] + n[2] * L[2])
             if iso:
-                key = (0, sum(-a - b for a, b in (self.rot_xy(p[0], p[1]) for p in pts)) / len(pts) + zavg)
+                key = (0, sum(-a - b for a, b in (rot(p[0], p[1]) for p in pts)) / len(pts) + zavg)
             else:
                 light *= 0.65 + 0.35 * min(1.0, max(0.0, (zavg - self.zlo) / zspan))
                 key = (0, zavg)
             col = "#%02x%02x%02x" % tuple(min(255, int(c * light * 255)) for c in rgb)
-            polys.append((key, [self.proj(*p) for p in pts], col, "face", fi))
+            polys.append((key, pp, col, "face", fi))
+
+        if self.props_on.get():
+            self.prop_polys(polys, cut, iso, L, zspan)
 
         if self.mode == "walls":
             self.shown = {i: v for i, v in self.clips.items() if v[0][2] <= cut}
@@ -1913,32 +2581,31 @@ class App:
         else:
             self.shown = {}
             for idx, (mn, mx, point, color) in self.visible_ents(cut).items():
-                if point:
-                    polys.append(((2, 0), [self.proj(*mn)], color, "point", idx))
+                if point:      # dots stay on top of props too: they mark what you can edit
+                    polys.append(((2, 0), [proj(*mn)], color, "point", idx))
                 else:
                     for part, ps, key in self.box_faces(mn, mx, cut):
                         polys.append(((1,) + key[1:], ps, color, "ebox" + part, idx))
                 self.area[idx] = 0 if point else (mx[0] - mn[0]) * (mx[1] - mn[1])
         polys.sort(key=lambda p: p[0])
+        self._t_build = time.perf_counter() - t_start
 
-        if self.S is None:        # fit, ignoring far-off bits like the 3D skybox
-            xs = sorted(p[0] for poly in polys if poly[3] == "face" for p in poly[1]) or [0, 1]
-            ys = sorted(p[1] for poly in polys if poly[3] == "face" for p in poly[1]) or [0, 1]
-            q = lambda v, f: v[min(len(v) - 1, int(len(v) * f))]
-            x0, x1, y0, y1 = q(xs, 0.01), q(xs, 0.99), q(ys, 0.01), q(ys, 0.99)
-            w = max(cv.winfo_width(), 400) - 60
-            h = max(cv.winfo_height(), 300) - 60
-            self.S = min(w / max(x1 - x0, 1), h / max(y1 - y0, 1))
-            self.T = (30 + (w - (x1 - x0) * self.S) / 2 - x0 * self.S,
-                      30 + (h - (y1 - y0) * self.S) / 2 - y0 * self.S)
         s, (tx, ty) = self.S, self.T
+        create = cv.create_polygon
         for _key, ps, fill, kind, ref in polys:
             flat = [c for (x, y) in ps for c in (x * s + tx, y * s + ty)]
             if kind == "face":
-                it = cv.create_polygon(flat, fill=fill, outline="")
-                self.item_face[it] = ref
+                self.item_face[create(flat, fill=fill, outline="")] = ref
+            elif kind == "prop":
+                create(flat, fill=fill, outline="")
+            elif kind == "leaf":                  # trees and bushes: see-through, so the street shows
+                create(flat, fill=fill, outline="", stipple="gray50")
+            elif kind == "emesh":
+                it = create(flat, fill=fill, outline="")
+                self.item_ent[it] = ref
+                self.ent_items.setdefault(ref, []).append((it, "emesh", fill))
             elif kind == "wall":
-                it = cv.create_polygon(flat, fill=RED, outline=RED, stipple="gray25", width=1)
+                it = create(flat, fill=RED, outline=RED, stipple="gray25", width=1)
                 self.item_brush[it] = ref
                 self.brush_items.setdefault(ref, []).append((it, fill))
             elif kind == "point":
@@ -1948,7 +2615,7 @@ class App:
                 self.item_ent[it] = ref
                 self.ent_items.setdefault(ref, []).append((it, "point", fill))
             else:
-                it = cv.create_polygon(flat, fill=fill, outline=fill, stipple="gray25", width=1)
+                it = create(flat, fill=fill, outline=fill, stipple="gray25", width=1)
                 self.item_ent[it] = ref
                 self.ent_items.setdefault(ref, []).append((it, kind, fill))
         if self.mode == "walls":
@@ -1959,6 +2626,77 @@ class App:
                 self.paint_ent(idx)
         self.hover = None
         self.count()
+        self._t_draw = time.perf_counter() - t_start
+        self._n_polys = len(polys)
+
+    def prop_polys(self, polys, cut, iso, L, zspan):
+        """add the props' triangles (or plain boxes when small on screen); returns entities drawn this way"""
+        cw, ch = max(self.cv.winfo_width(), 400), max(self.cv.winfo_height(), 300)
+        s, (tx, ty) = self.S, self.T
+        rot, proj = self.rot_xy, self.proj
+        items = [(p, "leaf" if p.mesh.leafy else "prop", None) for p in self.static_placed]
+        ent_mode = self.mode in ENT_MODES
+        for idx, e in enumerate(self.ents):
+            if e.get("model")[-4:].lower() != ".mdl":
+                continue
+            p = self.placed_for(e)
+            if p is not None:
+                items.append((p, "emesh" if ent_mode and self.ent_matches(e) else "prop", idx))
+        meshed = set()
+        zlo, L0, L1, L2 = self.zlo, L[0], L[1], L[2]
+        for p, kind, idx in items:
+            mn, mx = p.mins, p.maxs
+            if mn[2] > cut:
+                continue
+            dx, dy, dz = mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]
+            size = (dx * dx + dy * dy + dz * dz) ** 0.5 * s
+            cx, cy = proj(mn[0] + dx / 2, mn[1] + dy / 2, mn[2] + dz / 2)
+            sx, sy = cx * s + tx, cy * s + ty
+            if size < 4 or sx < -size or sy < -size or sx > cw + size or sy > ch + size:
+                continue
+            if size < 40 and mx[2] <= cut:                   # small on screen: one flat outline
+                hull = convex_hull([proj(*q) for q in p.corners])
+                c = p.boxc
+                if iso:
+                    key = (0, -sum(rot(mn[0] + dx / 2, mn[1] + dy / 2)) + mn[2] + dz / 2)
+                    light = 0.85
+                else:
+                    key = (0, mx[2])
+                    light = 0.85 * (0.65 + 0.35 * min(1.0, max(0.0, (mx[2] - zlo) / zspan)))
+                polys.append((key, hull, "#%02x%02x%02x" % (min(255, int(c[0] * light * 255)), min(
+                    255, int(c[1] * light * 255)), min(255, int(c[2] * light * 255))), kind, idx))
+                if kind == "emesh":
+                    meshed.add(idx)
+                    self.area[idx] = dx * dy
+                continue
+            src = p.box if size < 40 else (p.lite if size < 150 else p.full)
+            clipped = mx[2] > cut
+            for pts, n, rgb in src:
+                nx, ny = rot(n[0], n[1])
+                nz = n[2]
+                if iso:
+                    if -nx - ny + nz <= 0.02:
+                        continue
+                elif nz < 0.05:
+                    continue
+                if clipped and max(q[2] for q in pts) > cut:
+                    pts = clip_below(pts, cut)
+                    if len(pts) < 3:
+                        continue
+                zavg = sum(q[2] for q in pts) / len(pts)
+                light = 0.42 + 0.58 * max(0.0, nx * L0 + ny * L1 + nz * L2)
+                if iso:
+                    key = (0, sum(-a - b for a, b in (rot(q[0], q[1]) for q in pts)) / len(pts) + zavg)
+                else:
+                    light *= 0.65 + 0.35 * min(1.0, max(0.0, (zavg - zlo) / zspan))
+                    key = (0, zavg)
+                col = "#%02x%02x%02x" % (min(255, int(rgb[0] * light * 255)), min(255, int(rgb[1] * light * 255)),
+                                         min(255, int(rgb[2] * light * 255)))
+                polys.append((key, [proj(*q) for q in pts], col, kind, idx))
+            if kind == "emesh":
+                meshed.add(idx)
+                self.area[idx] = dx * dy
+        return meshed
 
     def box_faces(self, mn, mx, cut):
         top = min(mx[2], cut)
@@ -1996,6 +2734,8 @@ class App:
         return (o, o, True)
 
     def ent_matches(self, e):
+        if self.mode == "build":
+            return category(e.get("classname"))[0] in BUILD_CATS
         cat = self.cat_var.get()
         if cat != "All" and category(e.get("classname"))[0] != cat:
             return False
@@ -2026,7 +2766,9 @@ class App:
     def paint_ent(self, idx, hover=False):
         on = idx in self.sel
         for it, kind, color in self.ent_items.get(idx, []):
-            if kind == "point":
+            if kind == "emesh":
+                self.cv.itemconfig(it, outline=SELECT if (on or hover) else "", width=1)
+            elif kind == "point":
                 self.cv.itemconfig(it, outline=SELECT if (on or hover) else "#000000", width=3 if on else (2 if hover else 1))
             else:
                 self.cv.itemconfig(it, outline=SELECT if (on or hover) else color, width=3 if on else (2 if hover else 1),
@@ -2066,6 +2808,7 @@ class App:
             p = self.surface_point(e)
             self.status.config(text="  " + self.place_hint() + (
                 "   at %d %d %d" % p if p else "   (point at a floor or wall)"))
+            self.draw_ghost(p)
             return
         i = self.under(e)
         if self.hover is not None and self.hover != i:
@@ -2110,7 +2853,7 @@ class App:
             self.dragging = {"start": (e.x, e.y), "moved": False}
 
     def drag_entity(self, e):
-        if not self.dragging or self.mode != "ents":
+        if not self.dragging or self.mode not in ENT_MODES:
             return
         dx, dy = e.x - self.dragging["start"][0], e.y - self.dragging["start"][1]
         if not self.dragging["moved"] and abs(dx) + abs(dy) < 4:
@@ -2124,7 +2867,7 @@ class App:
 
     def drop_entity(self, e):
         d, self.dragging = self.dragging, None
-        if not d or not d["moved"] or self.mode != "ents":
+        if not d or not d["moved"] or self.mode not in ENT_MODES:
             return
         rx = (e.x - d["start"][0]) / self.S
         ry = -(e.y - d["start"][1]) / self.S
@@ -2169,7 +2912,7 @@ class App:
     def _filter_changed(self):
         if self.m:
             self.fill_list()
-            if self.mode == "ents":
+            if self.mode in ENT_MODES:
                 self.redraw()
 
     def fill_list(self):
@@ -2204,6 +2947,8 @@ class App:
         self.count()
 
     def show_props(self):
+        if self.mode == "build" and self.m:
+            self.update_build_info()
         self.props.delete(*self.props.get_children())
         if len(self.sel) != 1:
             if self.sel:
@@ -2352,7 +3097,7 @@ class App:
 
     # ---- placing new entities
     def start_place(self, template):
-        if self.mode != "ents" or not self.m:
+        if self.mode not in ENT_MODES or not self.m:
             return
         if template is None and len(self.sel) != 1:
             self.mb.showinfo("L4D2 Map Editor", "Select one entity first (a ladder, a prop...), then pick this.")
@@ -2362,15 +3107,38 @@ class App:
         self.count()
 
     def cancel_place(self):
+        self.cv.delete("ghost")
         if self.placing:
             self.placing = None
             self.cv.config(cursor="")
             self.count()
 
     def place_hint(self):
-        what = self.placing if isinstance(self.placing, str) else "a copy of " + \
-            self.ents[self.placing[1]].get("classname")
-        return "Click where to put %s (on a floor or wall). Esc cancels." % what
+        if isinstance(self.placing, str):
+            what = self.placing
+        elif self.placing[0] == "model":
+            what = self.placing[1].split("/")[-1][:-4] + " (press R to turn it after placing)"
+        else:
+            what = "a copy of " + self.ents[self.placing[1]].get("classname")
+        return "Click where to put %s. Esc cancels." % what
+
+    def model_offset(self, mesh, yaw):
+        """how high above the floor point the origin goes so the model stands on it"""
+        return -Placed(mesh, (0, 0, 0), (0, yaw, 0)).mins[2]
+
+    def draw_ghost(self, p):
+        """outline of the model under the mouse while placing it"""
+        self.cv.delete("ghost")
+        if not p or not self.placing or isinstance(self.placing, str) or self.placing[0] != "model":
+            return
+        mesh = self.mesh(self.placing[1])
+        if not mesh:
+            return
+        ghost = Placed(mesh, (p[0], p[1], p[2] + self.model_offset(mesh, self.build_yaw)), (0, self.build_yaw, 0))
+        s, (tx, ty) = self.S, self.T
+        for q, _n, _c in ghost.box:
+            flat = [c for pt in q for c in (lambda x, y: (x * s + tx, y * s + ty))(*self.proj(*pt))]
+            self.cv.create_polygon(flat, fill="", outline=SELECT, dash=(3, 2), tags="ghost")
 
     def surface_point(self, e):
         """the world point under the mouse, on the map surface you see there"""
@@ -2408,6 +3176,15 @@ class App:
         if isinstance(kind, str):
             new = Ent(TEMPLATES[kind]).with_value("origin", "%d %d %d" % p)
             new = new.with_value("hammerid", str(self.next_hammerid()))
+        elif kind[0] == "model":
+            mesh = self.mesh(kind[1])
+            if not mesh:
+                self.mb.showerror("L4D2 Map Editor", "Can't read the model %s." % kind[1])
+                return
+            z = p[2] + self.model_offset(mesh, self.build_yaw)
+            new = Ent([("classname", "prop_dynamic"), ("hammerid", str(self.next_hammerid())),
+                       ("origin", "%d %d %g" % (p[0], p[1], round(z, 1))), ("angles", "0 %g 0" % self.build_yaw),
+                       ("model", kind[1]), ("solid", "6"), ("disableshadows", "1")])
         else:
             src = self.ents[kind[1]]
             shape = self.ent_shape(src)
@@ -2420,6 +3197,205 @@ class App:
                 off = (p[0] - o[0], p[1] - o[1], p[2] - o[2])
             new = self.fresh_copy(src, off)
         self.change(add=[new], select={n})
+
+    # ---- build mode
+    def _lib_changed(self):
+        if getattr(self, "_lib_after", None):
+            self.root.after_cancel(self._lib_after)
+        self._lib_after = self.root.after(150, self.fill_library)
+
+    def fill_library(self):
+        self._lib_after = None
+        words = self.lib_search.get().lower().split()
+        keys = dict(LIB_CATS).get(self.lib_cat.get(), ())
+        self.lib.delete(*self.lib.get_children())
+        shown = 0
+        for path in self.library:
+            if keys and not any(k in path for k in keys):
+                continue
+            if words and not all(w in path for w in words):
+                continue
+            folder, _, name = path[7:].rpartition("/")
+            self.lib.insert("", "end", iid=path, values=(name[:-4], folder))
+            shown += 1
+        if not self.library:
+            self.preview_info.config(text="Open a map to see the props you can place. The props come from your "
+                                          "Left 4 Dead 2 folder.")
+
+    def show_preview(self):
+        sel = self.lib.selection()
+        pv = self.preview
+        pv.delete("all")
+        if not sel:
+            return
+        name = sel[0]
+        mesh = self.meshes.get(("preview", name))
+        if mesh is None:
+            mesh = load_mesh(self.files, name, self.mat_cache, limit=700) if self.files else None
+            self.meshes[("preview", name)] = mesh or False
+        if not mesh:
+            self.preview_info.config(text="%s\nCan't read this model." % name)
+            return
+        pv.update_idletasks()
+        w, h = max(pv.winfo_width(), 200), max(pv.winfo_height(), 120)
+        L = (-0.42, -0.58, 0.70)
+        pr = lambda x, y, z: ((x - y) * 0.866, -((x + y) * 0.5 + z))
+        polys = []
+        for (a, b, c), col in zip(mesh.tris, mesh.cols):
+            pts = (mesh.verts[a], mesh.verts[b], mesh.verts[c])
+            n = _cross(*pts)
+            ln = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) ** 0.5 or 1.0
+            n = (n[0] / ln, n[1] / ln, n[2] / ln)
+            if -n[0] - n[1] + n[2] <= 0.0:
+                continue
+            light = 0.42 + 0.58 * max(0.0, n[0] * L[0] + n[1] * L[1] + n[2] * L[2])
+            key = sum(-p[0] - p[1] + p[2] for p in pts)
+            polys.append((key, [pr(*p) for p in pts], "#%02x%02x%02x" % tuple(min(255, int(k * light * 255))
+                                                                               for k in col)))
+        xs = [x for _k, ps, _c in polys for x, _y in ps] or [0, 1]
+        ys = [y for _k, ps, _c in polys for _x, y in ps] or [0, 1]
+        sc = min((w - 20) / max(max(xs) - min(xs), 1), (h - 20) / max(max(ys) - min(ys), 1))
+        ox = (w - (max(xs) - min(xs)) * sc) / 2 - min(xs) * sc
+        oy = (h - (max(ys) - min(ys)) * sc) / 2 - min(ys) * sc
+        for _k, ps, col in sorted(polys, key=lambda p: p[0]):
+            pv.create_polygon([c for x, y in ps for c in (x * sc + ox, y * sc + oy)], fill=col, outline="")
+        size = [mesh.maxs[k] - mesh.mins[k] for k in range(3)]
+        info = "%d x %d x %d units (a survivor is 72 high)  -  " % (size[0], size[1], size[2])
+        info += "solid" if mesh.solid else "NOT solid: add an invisible wall around it"
+        self.preview_info.config(text=info)
+
+    def place_from_library(self):
+        sel = self.lib.selection()
+        if not sel or not self.m:
+            if not self.m:
+                self.mb.showinfo("L4D2 Map Editor", "Open a map first.")
+            return
+        if self.mode != "build":
+            self.mode_var.set("build")
+            self.set_mode()
+        self.placing = ("model", sel[0])
+        self.cv.config(cursor="crosshair")
+        self.count()
+
+    def sel_models(self):
+        """selected entities that are models: [(index, entity, Placed)]"""
+        out = []
+        for i in sorted(self.sel):
+            e = self.ents[i]
+            p = self.placed_for(e)
+            if p is not None:
+                out.append((i, e, p))
+        return out
+
+    def rotate_sel(self, deg):
+        items = self.sel_models()
+        if not items:
+            self.status.config(text="  Select a prop first (click it on the map), then turn it.")
+            return
+        rep = {}
+        for i, e, _p in items:
+            pitch, yaw, roll = parse_vec(e.get("angles"))
+            yaw = (yaw + deg) % 360
+            rep[i] = e.with_value("angles", "%g %g %g" % (pitch, round(yaw, 3), roll))
+            self.build_yaw = yaw
+        self.change(replace=rep)
+
+    def floor_at(self, x, y, below):
+        """height of the highest floor under (x, y) that is lower than `below`, or None"""
+        if self.floor_faces is None:
+            ff = []
+            for pts, n, dist, _rgb in self.faces:
+                if n[2] > 0.5:
+                    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+                    ff.append((min(xs), max(xs), min(ys), max(ys), pts, n, dist))
+            self.floor_faces = ff
+        best = None
+        for x0, x1, y0, y1, pts, n, dist in self.floor_faces:
+            if not (x0 <= x <= x1 and y0 <= y <= y1):
+                continue
+            inside = False
+            for j in range(len(pts)):
+                (ax, ay, _), (bx, by, _) = pts[j - 1], pts[j]
+                if (ay > y) != (by > y) and x < ax + (y - ay) * (bx - ax) / (by - ay):
+                    inside = not inside
+            if not inside:
+                continue
+            z = (dist - n[0] * x - n[1] * y) / n[2]
+            if z <= below and (best is None or z > best):
+                best = z
+        return best
+
+    def drop_sel(self):
+        items = self.sel_models()
+        if not items:
+            self.status.config(text="  Select a prop first, then drop it to the floor.")
+            return
+        rep = {}
+        for i, e, p in items:
+            x, y, z = e.origin()
+            f = self.floor_at(x, y, p.mins[2] + 8)
+            if f is not None:
+                rep[i] = e.with_value("origin", "%g %g %g" % (x, y, round(z - (p.mins[2] - f), 1)))
+        if rep:
+            self.change(replace=rep)
+        else:
+            self.status.config(text="  No floor found under it.")
+
+    def line_sel(self, direction):
+        items = self.sel_models()
+        if len(items) != 1:
+            self.status.config(text="  Select one prop, then add the next one in line.")
+            return
+        i, e, p = items[0]
+        mesh = p.mesh
+        ext = [mesh.maxs[k] - mesh.mins[k] for k in range(3)]
+        axis = 0 if ext[0] >= ext[1] else 1                  # along the prop's longest side
+        f, l, _u = angle_matrix(*parse_vec(e.get("angles")))
+        d = (f, l)[axis]
+        try:
+            scale = float(e.get("modelscale") or 1) or 1.0
+        except ValueError:
+            scale = 1.0
+        step = ext[axis] * scale * direction
+        new = self.fresh_copy(e, (d[0] * step, d[1] * step, d[2] * step))
+        self.change(add=[new], select={len(self.ents)})
+
+    def block_sel(self, extra):
+        items = self.sel_models()
+        if not items:
+            self.status.config(text="  Select a prop first, then add an invisible wall around it.")
+            return
+        added, hid = [], self.next_hammerid()
+        for k, (_i, _e, p) in enumerate(items):
+            mn, mx = p.mins, p.maxs
+            cx, cy = round((mn[0] + mx[0]) / 2), round((mn[1] + mx[1]) / 2)
+            lo = (round(mn[0] - cx), round(mn[1] - cy), 0)
+            hi = (round(mx[0] - cx), round(mx[1] - cy), round(mx[2] - mn[2] + extra))
+            v = lambda t: "%d %d %d" % t
+            new = Ent(TEMPLATES["Invisible wall (blocks everyone)"])
+            for key, val in (("origin", "%d %d %d" % (cx, cy, math.floor(mn[2]))), ("mins", v(lo)), ("maxs", v(hi)),
+                             ("boxmins", v(lo)), ("boxmaxs", v(hi)), ("hammerid", str(hid + k))):
+                new = new.with_value(key, val)
+            added.append(new)
+        self.change(add=added)
+        self.status.config(text="  Added %d invisible wall(s). They are boxes lined up with the map, so a turned "
+                                "prop gets a slightly bigger wall." % len(added))
+
+    def update_build_info(self):
+        items = self.sel_models()
+        if not self.sel:
+            txt = "Click a prop on the map to select it.  R turns it, arrows move it."
+        elif not items:
+            txt = "%d selected (not a prop)." % len(self.sel)
+        elif len(items) == 1:
+            i, e, p = items[0]
+            sz = [round(p.mesh.maxs[k] - p.mesh.mins[k]) for k in range(3)]
+            txt = "%s   %d x %d x %d   turned %g%s" % (
+                e.get("model").split("/")[-1][:-4], sz[0], sz[1], sz[2], parse_vec(e.get("angles"))[1],
+                "" if p.mesh.solid else "   (not solid)")
+        else:
+            txt = "%d props selected." % len(items)
+        self.build_info.config(text=txt)
 
     # ---- loading and saving
     def load_lmp(self):
@@ -2517,6 +3493,17 @@ class App:
                                 "ignores them, but check it's what you want." % (
                                     len(refs), refs[0][0].get("targetname") or refs[0][0].get("classname"),
                                     refs[0][2]))
+            solid_new = [e for e in added if e.get("classname").lower().startswith(
+                ("prop_", "env_physics_blocker", "env_player_blocker"))]
+            if solid_new:
+                warnings.append("You added %d prop(s) / invisible wall(s). Bots and infected only learn about "
+                                "new obstacles from the nav mesh: test with bots, and if they get stuck, see "
+                                "\"Bots won't follow\" in the guide." % len(solid_new))
+            gone = sorted({e.get("model") for e in added if e.get("model").lower().endswith(".mdl")
+                           and self.files and not self.files.has(e.get("model"))})
+            if gone:
+                warnings.append("%d added prop(s) use a model the game doesn't have (%s): they would show as "
+                                "an error model." % (len(gone), gone[0]))
         msg = "%s\n\nWrite to %s:\n%s" % (what, folder, "\n".join(
             "   %s%s" % (os.path.basename(f), "   (replaces your earlier one)" if over else "")
             for f, over, _ in files))
